@@ -24,6 +24,7 @@ from torch._inductor.select_algorithm import (
 
 
 aten = torch.ops.aten
+from torch._inductor.mock_cache import global_stats, PatchCaches, Stats
 from torch._inductor.test_case import run_tests, TestCase
 from torch._inductor.utils import fresh_inductor_cache, run_and_get_code
 from torch._inductor.virtualized import V
@@ -36,12 +37,6 @@ from torch.testing._internal.common_utils import (
     TEST_WITH_ROCM,
 )
 from torch.testing._internal.inductor_utils import HAS_CPU, HAS_CUDA
-
-
-try:
-    from .mock_cache import global_stats, PatchCaches, Stats
-except ImportError:
-    from mock_cache import global_stats, PatchCaches, Stats  # @manual
 
 
 torch.set_float32_matmul_precision("high")
@@ -76,7 +71,10 @@ class FailChoiceCaller(ChoiceCaller):
 @instantiate_parametrized_tests
 class TestMaxAutotune(TestCase):
     def _create_buffer(self, name, shape):
-        return Buffer(name, FixedLayout(torch.device("cuda:0"), torch.float32, shape))
+        return Buffer(
+            name=name,
+            layout=FixedLayout(torch.device("cuda:0"), dtype=torch.float32, size=shape),
+        )
 
     def test_benchmark_choice_in_subproc(self):
         gm = make_fx(
@@ -139,7 +137,7 @@ class TestMaxAutotune(TestCase):
             out = AlgorithmSelectorCache.benchmark_example_value(layout)
             expected_out = (mat1 @ mat2) + (mat3 @ mat4)
 
-            choice = FailChoiceCaller("fail_choice_caller", [], None)
+            choice = FailChoiceCaller("fail_choice_caller", [], None, description="")
 
             # use a tensor since python list is not synced back
             timings = torch.zeros(3, dtype=torch.float32)
@@ -236,7 +234,7 @@ class TestMaxAutotune(TestCase):
 
         class FakeChoiceCaller(ChoiceCaller):
             def __init__(self) -> None:
-                super().__init__("none", [], Mock())
+                super().__init__("none", [], Mock(), description="")
                 self.thread_id = None
 
             def precompile(self):
@@ -578,6 +576,32 @@ class TestMaxAutotune(TestCase):
     def test_empty_conv_input_with_1x1_kernel(self):
         self.test_empty_conv_input(kernel_size=1)
 
+    @config.patch(max_autotune_gemm_backends="TRITON")
+    def test_baddmm(self):
+        class M(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.weight = torch.nn.Parameter(
+                    torch.randn(64, 64, 192, dtype=torch.float16)
+                )
+                self.bias = torch.nn.Parameter(
+                    torch.randn(64, 1, 192, dtype=torch.float16)
+                )
+
+            def forward(self, x):
+                return torch.ops.aten.baddbmm.default(self.bias, x, self.weight)
+
+        x = torch.randn(
+            64, 2048, 64, dtype=torch.float16, requires_grad=False, device="cuda"
+        )
+        mod = M().cuda()
+
+        m_c = torch.compile(mode="max-autotune")(mod)
+        out, code = run_and_get_code(m_c, x)
+        self.assertEqual(out, mod(x))
+
+        FileCheck().check("triton_tem_fused_baddbmm").run(code[0])
+
     @config.patch(max_autotune=True)
     def test_conv1x1_with_free_symbols(self):
         """
@@ -838,17 +862,27 @@ class TestMaxAutotuneRemoteCache(TestCase):
                     with fresh_inductor_cache():
                         torch.compile(mm, dynamic=dynamic)(a, b)
                     reset()
+                with torch.compiler.config.patch(
+                    {"cache_key_tag": "test"}
+                ), fresh_inductor_cache():
+                    torch.compile(mm, dynamic=dynamic)(a, b)
+                    reset()
 
                 global_stats.report()
-                self.assertEqual(global_stats.autotune_remote, Stats(1, 3, 1))
+                self.assertEqual(global_stats.autotune_remote, Stats(2, 3, 2))
 
             global_stats.reset()
             for _ in range(4):
                 with fresh_inductor_cache():
                     torch.compile(f, dynamic=dynamic)(x, y)
                 reset()
+            with torch.compiler.config.patch(
+                {"cache_key_tag": "test"}
+            ), fresh_inductor_cache():
+                torch.compile(mm, dynamic=dynamic)(a, b)
+                reset()
             global_stats.report()
-            self.assertEqual(global_stats.autotune_remote, Stats(1, 3, 1))
+            self.assertEqual(global_stats.autotune_remote, Stats(2, 3, 2))
 
 
 class TestBenchmarkRequest(BenchmarkRequest):
@@ -950,5 +984,5 @@ if __name__ == "__main__":
     from torch._inductor.utils import is_big_gpu
 
     # Set env to make it work in CI.
-    if HAS_CUDA and HAS_CPU and is_big_gpu(0):
+    if HAS_CUDA and HAS_CPU and is_big_gpu():
         run_tests()

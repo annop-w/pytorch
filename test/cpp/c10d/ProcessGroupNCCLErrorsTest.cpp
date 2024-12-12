@@ -6,8 +6,10 @@
 #include <c10/util/irange.h>
 #include <torch/csrc/cuda/nccl.h>
 #include <torch/csrc/distributed/c10d/FileStore.hpp>
+#include <torch/csrc/distributed/c10d/FlightRecorder.hpp>
 #include <torch/csrc/distributed/c10d/NCCLUtils.hpp>
 #include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#include <utility>
 #include "CUDATest.hpp"
 #include "TestUtils.hpp"
 
@@ -47,7 +49,7 @@ class ProcessGroupNCCLSimulateErrors : public c10d::ProcessGroupNCCL {
       int rank,
       int size,
       c10::intrusive_ptr<c10d::ProcessGroupNCCL::Options> opts)
-      : ProcessGroupNCCL(store, rank, size, opts), simulateError_(false) {}
+      : ProcessGroupNCCL(store, rank, size, std::move(opts)) {}
 
   std::exception_ptr checkForNCCLErrors(
       std::shared_ptr<c10d::NCCLComm>& ncclComm) override {
@@ -93,7 +95,7 @@ class ProcessGroupNCCLSimulateErrors : public c10d::ProcessGroupNCCL {
   }
 
  private:
-  bool simulateError_;
+  bool simulateError_{false};
 };
 
 class WorkNCCLTimedoutErrors : public c10d::ProcessGroupNCCL::WorkNCCL {
@@ -127,9 +129,7 @@ class ProcessGroupNCCLTimedOutErrors : public ProcessGroupNCCLSimulateErrors {
       int rank,
       int size,
       c10::intrusive_ptr<c10d::ProcessGroupNCCL::Options> opts)
-      : ProcessGroupNCCLSimulateErrors(store, rank, size, opts),
-        watchDogDebugInfoFinished_(false),
-        setTimedoutError_(false) {}
+      : ProcessGroupNCCLSimulateErrors(store, rank, size, std::move(opts)) {}
 
   c10::intrusive_ptr<ProcessGroupNCCL::WorkNCCL> initWork(
       at::Device& device,
@@ -157,10 +157,6 @@ class ProcessGroupNCCLTimedOutErrors : public ProcessGroupNCCLSimulateErrors {
     setTimedoutError_ = false;
   }
 
-  bool getWatchDogDebugInfoFinishedFlag() {
-    return watchDogDebugInfoFinished_;
-  }
-
   // In the constructor of ProcessGroupNCCL. We don't allow the watchdog thread
   // to run any handling or desync report when the main thread is block wait.
   // Even if users set handling and turn on desyncDebug flag, they will get
@@ -171,16 +167,8 @@ class ProcessGroupNCCLTimedOutErrors : public ProcessGroupNCCLSimulateErrors {
     desyncDebug_ = true;
   }
 
- protected:
-  std::string getNCCLWatchdogDebugInfo() override {
-    LOG(INFO) << "overridden getNCCLWatchdogDebugInfo called";
-    watchDogDebugInfoFinished_ = true;
-    return "";
-  }
-  bool watchDogDebugInfoFinished_;
-
  private:
-  bool setTimedoutError_;
+  bool setTimedoutError_{false};
 };
 
 class ProcessGroupNCCLNoHeartbeatCaught
@@ -191,8 +179,7 @@ class ProcessGroupNCCLNoHeartbeatCaught
       int rank,
       int size,
       c10::intrusive_ptr<c10d::ProcessGroupNCCL::Options> opts)
-      : ProcessGroupNCCLTimedOutErrors(store, rank, size, opts),
-        hasMonitorThreadCaughtError_(false) {}
+      : ProcessGroupNCCLTimedOutErrors(store, rank, size, std::move(opts)) {}
 
   std::mutex& getWatchdogMutex() {
     return workMetaListMutex_;
@@ -223,11 +210,11 @@ class ProcessGroupNCCLNoHeartbeatCaught
   // It's really hard to unit test std::abort. So we override it instead.
   // Commented this override, we do see process aborted with core dump without
   // this override.
-  void terminateProcess(std::string errMsg) override {
+  void terminateProcess(const std::string& errMsg) override {
     throw std::runtime_error(errMsg);
   }
 
-  bool hasMonitorThreadCaughtError_;
+  bool hasMonitorThreadCaughtError_{false};
 };
 
 class ProcessGroupNCCLDebugInfoStuck
@@ -238,17 +225,7 @@ class ProcessGroupNCCLDebugInfoStuck
       int rank,
       int size,
       c10::intrusive_ptr<c10d::ProcessGroupNCCL::Options> opts)
-      : ProcessGroupNCCLNoHeartbeatCaught(store, rank, size, opts) {}
-
- protected:
-  // Override the heartbeat monitor function to set a long timeout to mimic the
-  // stuck in getting debug info.
-  std::string getNCCLWatchdogDebugInfo() override {
-    std::this_thread::sleep_for(
-        std::chrono::seconds(heartbeatTimeoutInSec_ * 20));
-    watchDogDebugInfoFinished_ = true;
-    return "";
-  }
+      : ProcessGroupNCCLNoHeartbeatCaught(store, rank, size, std::move(opts)) {}
 };
 
 class ProcessGroupNCCLErrorsTest : public ::testing::Test {
@@ -357,7 +334,7 @@ std::string readTraceFromFile(const std::string& filename, size_t size) {
   // Read the strings from the file
   if (file) { // While the file stream is in good state
     std::string str(size, '\0');
-    file.read(&str[0], size);
+    file.read(&str[0], static_cast<std::streamsize>(size));
     if (file) {
       return str;
     }
@@ -368,7 +345,7 @@ std::string readTraceFromFile(const std::string& filename, size_t size) {
 // Extend the nested class outside the parent class
 class TestDebugInfoWriter : public c10d::DebugInfoWriter {
  public:
-  TestDebugInfoWriter(std::string namePrefix)
+  TestDebugInfoWriter(const std::string& namePrefix)
       : DebugInfoWriter(namePrefix, 0) {}
 
   void write(const std::string& ncclTrace) override {
@@ -387,7 +364,7 @@ class TestDebugInfoWriter : public c10d::DebugInfoWriter {
 TEST_F(ProcessGroupNCCLErrorsTest, testNCCLErrorsNoHeartbeat) {
   int heartBeatIntervalInSec = 2;
   std::string timeInterval = std::to_string(heartBeatIntervalInSec);
-  ASSERT_TRUE(setenv(c10d::TORCH_NCCL_BLOCKING_WAIT[0].c_str(), "1", 1) == 0);
+  ASSERT_TRUE(setenv(c10d::TORCH_NCCL_BLOCKING_WAIT[0].c_str(), "0", 1) == 0);
   ASSERT_TRUE(
       setenv(
           c10d::TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC[0].c_str(),
@@ -433,7 +410,7 @@ TEST_F(ProcessGroupNCCLErrorsTest, testNCCLErrorsNoHeartbeat) {
     EXPECT_TRUE(pg.getErrorCaughtFlag());
   }
   work->wait();
-  EXPECT_TRUE(traces.size() > 0);
+  EXPECT_TRUE(!traces.empty());
   auto filename = c10::str(tempFilename, 0);
   auto traceFromStorage = readTraceFromFile(filename, traces.size());
   // Check the traces read from storage match with the original nccl trace.
@@ -492,10 +469,6 @@ TEST_F(ProcessGroupNCCLWatchdogTimeoutTest, testNCCLTimedoutDebugInfoFinished) {
   pg.forceTryWriteDebugInfo();
   watchdogTimeoutTestCommon(pg, 2);
 
-  // The flag is true shows that the heartbeat monitor thread does not kill
-  // the watchdog thread when it is getting debug info such as desync debug
-  // info.
-  EXPECT_TRUE(pg.getWatchDogDebugInfoFinishedFlag());
   // The flag is false shows that the heartbeat monitor thread does not
   // trigger process abort if getting debug info and destroy PG is fast.
   EXPECT_FALSE(pg.getErrorCaughtFlag());
@@ -508,9 +481,6 @@ TEST_F(ProcessGroupNCCLWatchdogTimeoutTest, testNCCLTimedoutDebugInfoStuck) {
   // Need to keep main thread sleep longer so that we can let heartbeat monitor
   // thread to finish the extra wait and flip the flag.
   watchdogTimeoutTestCommon(pg, 4);
-  // The flag is false shows that we get stuck in getting debug info such as
-  // desync debug info in the watchdog thread.
-  EXPECT_FALSE(pg.getWatchDogDebugInfoFinishedFlag());
   // The flag is true shows that the heartbeat monitor thread does trigger
   // process abort if getting debug info gets stuck.
   EXPECT_TRUE(pg.getErrorCaughtFlag());
